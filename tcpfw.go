@@ -142,15 +142,8 @@ func monitor() {
 }
 
 func isBanned(remoteIP string) bool {
-    banned := false
-    bannedIp.Range(func(ip, _ interface{}) bool {
-        if ip == remoteIP {
-            banned = true
-            return false
-        }
-        return true
-    })
-    return banned
+    _, exists := bannedIp.Load(remoteIP)
+    return exists
 }
 
 func handle(localConn net.Conn, remoteIP string) {
