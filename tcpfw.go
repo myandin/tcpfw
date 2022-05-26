@@ -6,32 +6,35 @@ import (
     "io"
     "log"
     "net"
-    "sync"
     "os"
+    "strings"
+    "sync"
+    "sync/atomic"
     "time"
     "unsafe"
-    "strings"
 )
 
 var (
-localAddr *string = flag.String("listen", ":8443", "listen address:port or just :port")
-remoteAddr *string = flag.String("protect", "example.com:443", "protected address")
+    localAddr  *string = flag.String("listen", ":8443", "listen address:port or just :port")
+    remoteAddr *string = flag.String("protect", "example.com:443", "protected address")
 
-connLimit *int = flag.Int("connlimit", 10, "limit connects per ip")
-rpsLimit *int = flag.Int("rpslimit", 10, "limit rps per ip")
-banTime *float64 = flag.Float64("bantime", 600, "blocking time of the banned ip (seconds)")
+    connLimit *int     = flag.Int("connlimit", 10, "limit connects per ip")
+    rpsLimit  *int     = flag.Int("rpslimit", 10, "limit rps per ip")
+    banTime   *float64 = flag.Float64("bantime", 600, "blocking time of the banned ip (seconds)")
 
-accessLog *string = flag.String("access", "tcpfw.access.log", "full path to log file with access IPs")
-bannedLog *string = flag.String("banned", "tcpfw.banned.log", "full path to log file with banned IPs")
+    accessLog *string = flag.String("access", "tcpfw.access.log", "full path to log file with access IPs")
+    bannedLog *string = flag.String("banned", "tcpfw.banned.log", "full path to log file with banned IPs")
 
-connPerIp sync.Map
-rpsPerIp sync.Map
-bannedIp sync.Map
-connMap sync.Map
+    connPerIp      = map[string]int{}
+    connPerIPMutex = sync.Mutex{}
 
-access_log_chan = make(chan string)
-banned_log_chan = make(chan string)
+    connectionsCount uint64
 
+    rpsPerIp sync.Map
+    bannedIp sync.Map
+
+    accessLogChan = make(chan string)
+    bannedLogChan = make(chan string)
 )
 
 func main() {
@@ -57,24 +60,30 @@ func main() {
         }
 
         remoteIP := strings.Split(localConn.RemoteAddr().String(), ":")[0]
+
         if isBanned(remoteIP) {
             localConn.Close()
             continue
         }
-        connections, ok := connPerIp.Load(remoteIP)
-        if ok {
-            if connections.(int) >= *connLimit {
-                bannedIp.Store(remoteIP, time.Now())
-                banned_log_chan <- remoteIP + " [" + time.Now().Format("2006-01-02 15:04:05") + "] Banned due to connection limit"
-                localConn.Close()
-                continue
-            }
-            connPerIp.Store(remoteIP, connections.(int)+1)
-        } else {
-            connPerIp.Store(remoteIP, 1)
+
+        connPerIPMutex.Lock()
+        connections, ok := connPerIp[remoteIP]
+        connPerIPMutex.Unlock()
+
+        if ok && connections >= *connLimit {
+            bannedIp.Store(remoteIP, time.Now())
+            bannedLogChan <- remoteIP + " [" + time.Now().Format("2006-01-02 15:04:05") + "] Banned due to connection limit"
+            localConn.Close()
+            continue
         }
-        connMap.Store(localConn.RemoteAddr().String(), localConn)
-        access_log_chan <- remoteIP + " [" + time.Now().Format("2006-01-02 15:04:05") + "] Connected"
+
+        connPerIPMutex.Lock()
+        c := connPerIp[remoteIP]
+        connPerIp[remoteIP] = c + 1
+        connPerIPMutex.Unlock()
+
+        atomic.AddUint64(&connectionsCount, 1)
+        accessLogChan <- remoteIP + " [" + time.Now().Format("2006-01-02 15:04:05") + "] Connected"
         go handle(localConn, remoteIP)
     }
 }
@@ -85,7 +94,7 @@ func access_log() {
         fmt.Printf("Error message: %s\n", err)
         os.Exit(1)
     }
-    for v := range access_log_chan {
+    for v := range accessLogChan {
         file.Write(str2bytes(v + "\n"))
     }
 }
@@ -96,7 +105,7 @@ func banned_log() {
         fmt.Printf("Error message: %s\n", err)
         os.Exit(1)
     }
-    for v := range banned_log_chan {
+    for v := range bannedLogChan {
         file.Write(str2bytes(v + "\n"))
     }
 }
@@ -117,21 +126,20 @@ func unban() {
 func monitor() {
     for {
         rps := 0
-        currentConn := 0
+        currentConn := uint64(0)
         bannedIP := 0
         rpsPerIp.Range(func(ip, times interface{}) bool {
             rps++
             if times.(int) >= *rpsLimit {
                 bannedIp.Store(ip.(string), time.Now())
-                banned_log_chan <- ip.(string) + " [" + time.Now().Format("2006-01-02 15:04:05") + "] Banned due to rps limit"
+                bannedLogChan <- ip.(string) + " [" + time.Now().Format("2006-01-02 15:04:05") + "] Banned due to rps limit"
             }
             rpsPerIp.Delete(ip.(string))
             return true
         })
-        connMap.Range(func(addr, conn interface{}) bool {
-            currentConn++
-            return true
-        })
+
+        currentConn = atomic.LoadUint64(&connectionsCount)
+
         bannedIp.Range(func(ip, time_banned interface{}) bool {
             bannedIP++
             return true
@@ -148,35 +156,45 @@ func isBanned(remoteIP string) bool {
 
 func handle(localConn net.Conn, remoteIP string) {
     defer localConn.Close()
-    defer func() {
-        connections, ok := connPerIp.Load(remoteIP)
-        if ok && connections.(int) > 0 {
-            connPerIp.Store(remoteIP, connections.(int)-1)
-        } else {
-            connPerIp.Delete(remoteIP)
-        }
 
-        connMap.Delete(localConn.RemoteAddr().String())
+    defer func() {
+        connPerIPMutex.Lock()
+        connections := connPerIp[remoteIP]
+        if connections == 0 {
+            connPerIPMutex.Unlock()
+            return
+        }
+        nc := connections - 1
+        if nc == 0 {
+            delete(connPerIp, remoteIP)
+        } else {
+            connPerIp[remoteIP] = nc
+        }
+        connPerIPMutex.Unlock()
+        atomic.AddUint64(&connectionsCount, ^uint64(0))
     }()
+
     if localConn, ok := localConn.(*net.TCPConn); ok {
         localConn.SetNoDelay(false)
     }
+
     var remoteConn net.Conn
     requestsPerConnection := 0
+
     for {
         localConn.SetDeadline(time.Now().Add(10 * time.Second))
 
         if isBanned(remoteIP) {
             return
         }
-        if requestsPerConnection >= 50 {
+        if requestsPerConnection >= *rpsLimit {
             return
         }
         buf := make([]byte, 8192)
         n, err := localConn.Read(buf)
         if err != nil {
             if remoteConn != nil {
-            remoteConn.Close()
+                remoteConn.Close()
             }
             return
         }
@@ -184,7 +202,7 @@ func handle(localConn net.Conn, remoteIP string) {
         if remoteConn == nil {
             remoteConn, err = net.DialTimeout("tcp", *remoteAddr, time.Second*10)
             if err != nil {
-//                localConn.Write(str2bytes(errMsg))
+                //                localConn.Write(str2bytes(errMsg))
                 return
             }
             if remoteConn, ok := remoteConn.(*net.TCPConn); ok {
@@ -197,8 +215,8 @@ func handle(localConn net.Conn, remoteIP string) {
                 remoteConn.Close()
                 localConn.Close()
             }()
-        } else {
         }
+
         remoteConn.SetDeadline(time.Now().Add(10 * time.Second))
         remoteConn.Write(request)
         requestsPerConnection++
