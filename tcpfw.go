@@ -129,7 +129,7 @@ func monitor() {
         currentConn := uint64(0)
         bannedIP := 0
         rpsPerIp.Range(func(ip, times interface{}) bool {
-            rps++
+            rps +=  times.(int)
             if times.(int) >= *rpsLimit {
                 bannedIp.Store(ip.(string), time.Now())
                 bannedLogChan <- ip.(string) + " [" + time.Now().Format("2006-01-02 15:04:05") + "] Banned due to rps limit"
