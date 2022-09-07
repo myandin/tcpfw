@@ -19,7 +19,7 @@ var (
     remoteAddr *string = flag.String("protect", "example.com:443", "protected address")
 
     connLimit *int     = flag.Int("connlimit", 10, "limit connects per ip")
-    rpsLimit  *int     = flag.Int("rpslimit", 10, "limit rps per ip")
+    rpsLimit  *int     = flag.Int("rpslimit", 100, "limit rps per ip")
     banTime   *float64 = flag.Float64("bantime", 600, "blocking time of the banned ip (seconds)")
 
     accessLog *string = flag.String("access", "tcpfw.access.log", "full path to log file with access IPs")
