@@ -182,7 +182,7 @@ func handle(localConn net.Conn, remoteIP string) {
     requestsPerConnection := 0
 
     for {
-        localConn.SetDeadline(time.Now().Add(10 * time.Second))
+//        localConn.SetDeadline(time.Now().Add(10 * time.Second))
 
         if isBanned(remoteIP) {
             return
@@ -217,7 +217,7 @@ func handle(localConn net.Conn, remoteIP string) {
             }()
         }
 
-        remoteConn.SetDeadline(time.Now().Add(10 * time.Second))
+//        remoteConn.SetDeadline(time.Now().Add(10 * time.Second))
         remoteConn.Write(request)
         requestsPerConnection++
         rps, ok := rpsPerIp.Load(remoteIP)
